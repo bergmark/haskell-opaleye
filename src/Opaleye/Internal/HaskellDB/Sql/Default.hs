@@ -5,15 +5,18 @@
 module Opaleye.Internal.HaskellDB.Sql.Default  where
 
 import Opaleye.Internal.HaskellDB.PrimQuery
+import qualified Opaleye.Internal.HaskellDB.PrimQuery as PQ
 import Opaleye.Internal.HaskellDB.Sql
 import Opaleye.Internal.HaskellDB.Sql.Generate
+import qualified Opaleye.Internal.HaskellDB.Sql as Sql
 import Opaleye.Internal.Tag (tagWith)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Base16 as Base16
+import qualified Data.List.NonEmpty as NEL
 
 mkSqlGenerator :: SqlGenerator -> SqlGenerator
-mkSqlGenerator gen = SqlGenerator 
+mkSqlGenerator gen = SqlGenerator
     {
      sqlUpdate      = defaultSqlUpdate      gen,
      sqlDelete      = defaultSqlDelete      gen,
@@ -28,43 +31,52 @@ defaultSqlGenerator = mkSqlGenerator defaultSqlGenerator
 
 
 toSqlOrder :: SqlGenerator -> OrderExpr -> (SqlExpr,SqlOrder)
-toSqlOrder gen (OrderExpr o e) = (sqlExpr gen e, o')
-    where o' = case o of
-                 OpAsc  -> SqlAsc
-                 OpDesc -> SqlDesc
+toSqlOrder gen (OrderExpr o e) =
+  (sqlExpr gen e, Sql.SqlOrder { sqlOrderDirection = o'
+                               , sqlOrderNulls     = orderNulls' })
+    where o' = case PQ.orderDirection o of
+            PQ.OpAsc  -> Sql.SqlAsc
+            PQ.OpDesc -> Sql.SqlDesc
+          orderNulls' = case PQ.orderNulls o of
+            PQ.NullsFirst -> Sql.SqlNullsFirst
+            PQ.NullsLast  -> Sql.SqlNullsLast
+
+
+toSqlColumn :: Attribute -> SqlColumn
+toSqlColumn attr = SqlColumn attr
 
 toSqlAssoc :: SqlGenerator -> Assoc -> [(SqlColumn,SqlExpr)]
-toSqlAssoc gen = map (\(attr,expr) -> (SqlColumn attr, sqlExpr gen expr))
+toSqlAssoc gen = map (\(attr,expr) -> (toSqlColumn attr, sqlExpr gen expr))
 
 
-defaultSqlUpdate :: SqlGenerator 
+defaultSqlUpdate :: SqlGenerator
                  -> TableName  -- ^ Name of the table to update.
-	         -> [PrimExpr] -- ^ Conditions which must all be true for a row
+                 -> [PrimExpr] -- ^ Conditions which must all be true for a row
                                --   to be updated.
                  -> Assoc -- ^ Update the data with this.
-	         -> SqlUpdate
+                 -> SqlUpdate
 defaultSqlUpdate gen name criteria assigns
-        = SqlUpdate name (toSqlAssoc gen assigns) (map (sqlExpr gen) criteria) 
+        = SqlUpdate (SqlTable name) (toSqlAssoc gen assigns) (map (sqlExpr gen) criteria)
 
 
-defaultSqlInsert :: SqlGenerator 
+defaultSqlInsert :: SqlGenerator
+                 -> TableName
+                 -> [Attribute]
+                 -> NEL.NonEmpty [PrimExpr]
+                 -> SqlInsert
+defaultSqlInsert gen name attrs exprs =
+  SqlInsert (SqlTable name) (map toSqlColumn attrs) ((fmap . map) (sqlExpr gen) exprs)
+
+defaultSqlDelete :: SqlGenerator
                  -> TableName -- ^ Name of the table
-	         -> Assoc -- ^ What to insert.
-	         -> SqlInsert
-defaultSqlInsert gen table assoc = SqlInsert table cs es
-    where (cs,es) = unzip (toSqlAssoc gen assoc)
-
-
-defaultSqlDelete :: SqlGenerator 
-                 -> TableName -- ^ Name of the table
-	         -> [PrimExpr] -- ^ Criteria which must all be true for a row
+                 -> [PrimExpr] -- ^ Criteria which must all be true for a row
                                --   to be deleted.
-	         -> SqlDelete
-defaultSqlDelete gen name criteria = SqlDelete name (map (sqlExpr gen) criteria)
+                 -> SqlDelete
+defaultSqlDelete gen name criteria = SqlDelete (SqlTable name) (map (sqlExpr gen) criteria)
 
 
 defaultSqlExpr :: SqlGenerator -> PrimExpr -> SqlExpr
-defaultSqlExpr gen expr = 
+defaultSqlExpr gen expr =
     case expr of
       AttrExpr (Symbol a t) -> ColumnSqlExpr (SqlColumn (tagWith t a))
       BaseTableAttrExpr a -> ColumnSqlExpr (SqlColumn a)
@@ -99,39 +111,49 @@ defaultSqlExpr gen expr =
                                 UnOpFun     -> FunSqlExpr op' [e']
                                 UnOpPrefix  -> PrefixSqlExpr op' (ParensSqlExpr e')
                                 UnOpPostfix -> PostfixSqlExpr op' e'
+      -- TODO: The current arrangement whereby the delimeter parameter
+      -- of string_agg is in the AggrStringAggr constructor, but the
+      -- parameter being aggregated is not, seems unsatisfactory
+      -- because it leads to a non-uniformity of treatment, as seen
+      -- below.  Perhaps we should have just `AggrExpr AggrOp` and
+      -- always put the `PrimExpr` in the `AggrOp`.
       AggrExpr op e    -> let op' = showAggrOp op
                               e' = sqlExpr gen e
-                           in AggrFunSqlExpr op' [e']
+                              moreAggrFunParams = case op of
+                                AggrStringAggr primE -> [sqlExpr gen primE]
+                                _ -> []
+                           in AggrFunSqlExpr op' (e' : moreAggrFunParams)
       ConstExpr l      -> ConstSqlExpr (sqlLiteral gen l)
-      CaseExpr cs e    -> let cs' = [(sqlExpr gen c, sqlExpr gen x)| (c,x) <- cs] 
+      CaseExpr cs e    -> let cs' = [(sqlExpr gen c, sqlExpr gen x)| (c,x) <- cs]
                               e'  = sqlExpr gen e
                            in CaseSqlExpr cs' e'
       ListExpr es      -> ListSqlExpr (map (sqlExpr gen) es)
       ParamExpr n _    -> ParamSqlExpr n PlaceHolderSqlExpr
       FunExpr n exprs  -> FunSqlExpr n (map (sqlExpr gen) exprs)
       CastExpr typ e1 -> CastSqlExpr typ (sqlExpr gen e1)
+      DefaultInsertExpr -> DefaultSqlExpr
 
 showBinOp :: BinOp -> String
-showBinOp  OpEq         = "=" 
-showBinOp  OpLt         = "<" 
-showBinOp  OpLtEq       = "<=" 
-showBinOp  OpGt         = ">" 
-showBinOp  OpGtEq       = ">=" 
-showBinOp  OpNotEq      = "<>" 
-showBinOp  OpAnd        = "AND"  
-showBinOp  OpOr         = "OR" 
-showBinOp  OpLike       = "LIKE" 
-showBinOp  OpIn         = "IN" 
+showBinOp  OpEq         = "="
+showBinOp  OpLt         = "<"
+showBinOp  OpLtEq       = "<="
+showBinOp  OpGt         = ">"
+showBinOp  OpGtEq       = ">="
+showBinOp  OpNotEq      = "<>"
+showBinOp  OpAnd        = "AND"
+showBinOp  OpOr         = "OR"
+showBinOp  OpLike       = "LIKE"
+showBinOp  OpIn         = "IN"
 showBinOp  (OpOther s)  = s
-showBinOp  OpCat        = "||" 
-showBinOp  OpPlus       = "+" 
-showBinOp  OpMinus      = "-" 
-showBinOp  OpMul        = "*" 
-showBinOp  OpDiv        = "/" 
-showBinOp  OpMod        = "MOD" 
-showBinOp  OpBitNot     = "~" 
-showBinOp  OpBitAnd     = "&" 
-showBinOp  OpBitOr      = "|" 
+showBinOp  OpCat        = "||"
+showBinOp  OpPlus       = "+"
+showBinOp  OpMinus      = "-"
+showBinOp  OpMul        = "*"
+showBinOp  OpDiv        = "/"
+showBinOp  OpMod        = "MOD"
+showBinOp  OpBitNot     = "~"
+showBinOp  OpBitAnd     = "&"
+showBinOp  OpBitOr      = "|"
 showBinOp  OpBitXor     = "^"
 showBinOp  OpAsg        = "="
 
@@ -151,22 +173,24 @@ sqlUnOp  (UnOpOther s) = (s, UnOpFun)
 
 
 showAggrOp :: AggrOp -> String
-showAggrOp AggrCount    = "COUNT" 
-showAggrOp AggrSum      = "SUM" 
-showAggrOp AggrAvg      = "AVG" 
-showAggrOp AggrMin      = "MIN" 
-showAggrOp AggrMax      = "MAX" 
-showAggrOp AggrStdDev   = "StdDev" 
-showAggrOp AggrStdDevP  = "StdDevP" 
-showAggrOp AggrVar      = "Var" 
-showAggrOp AggrVarP     = "VarP"                
-showAggrOp AggrBoolAnd  = "BOOL_AND"
-showAggrOp AggrBoolOr   = "BOOL_OR"
-showAggrOp (AggrOther s)        = s
+showAggrOp AggrCount          = "COUNT"
+showAggrOp AggrSum            = "SUM"
+showAggrOp AggrAvg            = "AVG"
+showAggrOp AggrMin            = "MIN"
+showAggrOp AggrMax            = "MAX"
+showAggrOp AggrStdDev         = "StdDev"
+showAggrOp AggrStdDevP        = "StdDevP"
+showAggrOp AggrVar            = "Var"
+showAggrOp AggrVarP           = "VarP"
+showAggrOp AggrBoolAnd        = "BOOL_AND"
+showAggrOp AggrBoolOr         = "BOOL_OR"
+showAggrOp AggrArr            = "ARRAY_AGG"
+showAggrOp (AggrStringAggr _) = "STRING_AGG"
+showAggrOp (AggrOther s)      = s
 
 
 defaultSqlLiteral :: SqlGenerator -> Literal -> String
-defaultSqlLiteral _ l = 
+defaultSqlLiteral _ l =
     case l of
       NullLit       -> "NULL"
       DefaultLit    -> "DEFAULT"
@@ -186,7 +210,7 @@ defaultSqlQuote _ s = quote s
 -- | Quote a string and escape characters that need escaping
 --   We use Postgres "escape strings", i.e. strings prefixed
 --   with E, to ensure that escaping with backslash is valid.
-quote :: String -> String 
+quote :: String -> String
 quote s = "E'" ++ concatMap escape s ++ "'"
 
 -- | Escape characters that need escaping

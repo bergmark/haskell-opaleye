@@ -1,8 +1,9 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE Rank2Types #-}
 
 module Opaleye.Internal.Table where
 
-import           Opaleye.Internal.Column (Column(Column))
+import           Opaleye.Internal.Column (Column, unColumn)
 import qualified Opaleye.Internal.TableMaker as TM
 import qualified Opaleye.Internal.Tag as Tag
 import qualified Opaleye.Internal.PrimQuery as PQ
@@ -10,10 +11,14 @@ import qualified Opaleye.Internal.PackMap as PM
 
 import qualified Opaleye.Internal.HaskellDB.PrimQuery as HPQ
 
+import qualified Data.Functor.Identity as I
 import           Data.Profunctor (Profunctor, dimap, lmap)
 import           Data.Profunctor.Product (ProductProfunctor, empty, (***!))
 import qualified Data.Profunctor.Product as PP
+import qualified Data.List.NonEmpty as NEL
+import           Data.Monoid (Monoid, mempty, mappend)
 import           Control.Applicative (Applicative, pure, (<*>), liftA2)
+import qualified Control.Arrow as Arr
 
 -- | Define a table as follows, where \"id\", \"color\", \"location\",
 -- \"quantity\" and \"radius\" are the tables columns in Postgres and
@@ -48,14 +53,18 @@ data TableProperties writerColumns viewColumns =
 
 data View columns = View columns
 
--- If we switch to a more lens-like approach to PackMap this should be
--- the equivalent of a Fold
-
 -- There's no reason the second parameter should exist except that we
 -- use ProductProfunctors more than ProductContravariants so it makes
 -- things easier if we make it one of the former.
-data Writer columns dummy =
-  Writer (PM.PackMap (HPQ.PrimExpr, String) () columns ())
+--
+-- Writer has become very mysterious.  I really couldn't tell you what
+-- it means.  It seems to be saying that a `Writer` tells you how an
+-- `f columns` contains a list of `(f HPQ.PrimExpr, String)`, i.e. how
+-- it contains each column: a column header and the entries in this
+-- column for all the rows.
+newtype Writer columns dummy =
+  Writer (forall f. Functor f =>
+          PM.PackMap (f HPQ.PrimExpr, String) () (f columns) ())
 
 queryTable :: TM.ColumnMaker viewColumns columns
             -> Table writerColumns viewColumns
@@ -83,18 +92,36 @@ runColumnMaker cm tag tableCols = PM.run (TM.runColumnMaker cm f tableCols) wher
 
 runWriter :: Writer columns columns' -> columns -> [(HPQ.PrimExpr, String)]
 runWriter (Writer (PM.PackMap f)) columns = outColumns
-  where extractColumns t = ([t], ())
-        (outColumns, ()) = f extractColumns columns
+  where (outColumns, ()) = f extract (I.Identity columns)
+        extract (pes, s) = ([(I.runIdentity pes, s)], ())
+
+-- This works more generally for any "zippable", that is an
+-- Applicative that satisfies
+--
+--    x == (,) <$> fmap fst x <*> fmap snd x
+--
+-- However, I'm unaware of a typeclass for this.
+runWriter' :: Writer columns columns' -> NEL.NonEmpty columns -> (NEL.NonEmpty [HPQ.PrimExpr], [String])
+runWriter' (Writer (PM.PackMap f)) columns = Arr.first unZip outColumns
+  where (outColumns, ()) = f extract columns
+        extract (pes, s) = ((Zip (fmap return pes), [s]), ())
+
+data Zip a = Zip { unZip :: NEL.NonEmpty [a] }
+
+instance Monoid (Zip a) where
+  mempty = Zip mempty'
+    where mempty' = [] `NEL.cons` mempty'
+  Zip xs `mappend` Zip ys = Zip (NEL.zipWith (++) xs ys)
 
 required :: String -> Writer (Column a) (Column a)
 required columnName =
-  Writer (PM.PackMap (\f (Column primExpr) -> f (primExpr, columnName)))
+  Writer (PM.PackMap (\f columns -> f (fmap unColumn columns, columnName)))
 
 optional :: String -> Writer (Maybe (Column a)) (Column a)
 optional columnName =
-  Writer (PM.PackMap (\f c -> case c of
-                         Nothing -> pure ()
-                         Just (Column primExpr) -> f (primExpr, columnName)))
+  Writer (PM.PackMap (\f columns -> f (fmap maybeUnColumn columns, columnName)))
+  where maybeUnColumn Nothing = HPQ.DefaultInsertExpr
+        maybeUnColumn (Just column) = unColumn column
 
 -- {
 
@@ -108,7 +135,7 @@ instance Applicative (Writer a) where
   Writer f <*> Writer x = Writer (liftA2 (\_ _ -> ()) f x)
 
 instance Profunctor Writer where
-  dimap f _ (Writer h) = Writer (lmap f h)
+  dimap f _ (Writer h) = Writer (lmap (fmap f) h)
 
 instance ProductProfunctor Writer where
   empty = PP.defaultEmpty

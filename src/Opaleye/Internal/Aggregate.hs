@@ -16,6 +16,11 @@ import qualified Opaleye.Internal.HaskellDB.PrimQuery as HPQ
 An 'Aggregator' takes a collection of rows of type @a@, groups
 them, and transforms each group into a single row of type @b@. This
 corresponds to aggregators using @GROUP BY@ in SQL.
+
+An 'Aggregator' corresponds closely to a 'Control.Foldl.Fold' from the
+@foldl@ package.  Whereas an 'Aggregator' @a@ @b@ takes each group of
+type @a@ to a single row of type @b@, a 'Control.Foldl.Fold' @a@ @b@
+takes a list of @a@ and returns a single row of type @b@.
 -}
 newtype Aggregator a b = Aggregator
                          (PM.PackMap (Maybe HPQ.AggrOp, HPQ.PrimExpr) HPQ.PrimExpr
@@ -30,7 +35,7 @@ makeAggr = makeAggr' . Just
 
 runAggregator :: Applicative f => Aggregator a b
               -> ((Maybe HPQ.AggrOp, HPQ.PrimExpr) -> f HPQ.PrimExpr) -> a -> f b
-runAggregator (Aggregator a) = PM.packmap a
+runAggregator (Aggregator a) = PM.traversePM a
 
 aggregateU :: Aggregator a b
            -> (a, PQ.PrimQuery, T.Tag) -> (b, PQ.PrimQuery, T.Tag)
@@ -59,5 +64,8 @@ instance P.Profunctor Aggregator where
 instance PP.ProductProfunctor Aggregator where
   empty = PP.defaultEmpty
   (***!) = PP.defaultProfunctorProduct
+
+instance PP.SumProfunctor Aggregator where
+  Aggregator x1 +++! Aggregator x2 = Aggregator (x1 PP.+++! x2)
 
 -- }

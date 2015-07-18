@@ -3,12 +3,15 @@
 module Opaleye.Operators (module Opaleye.Operators,
                           (O..&&)) where
 
+import qualified Data.Foldable as F
+
 import           Opaleye.Internal.Column (Column(Column), unsafeCase_,
                                           unsafeIfThenElse, unsafeGt)
 import qualified Opaleye.Internal.Column as C
 import           Opaleye.Internal.QueryArr (QueryArr(QueryArr))
 import qualified Opaleye.Internal.PrimQuery as PQ
 import qualified Opaleye.Internal.Operators as O
+import qualified Opaleye.Order as Ord
 import qualified Opaleye.PGTypes as T
 
 import qualified Opaleye.Internal.HaskellDB.PrimQuery as HPQ
@@ -34,19 +37,19 @@ infix 4 ./=
 (./=) = C.binOp HPQ.OpNotEq
 
 infix 4 .>
-(.>) :: Column a -> Column a -> Column T.PGBool
+(.>) :: Ord.PGOrd a => Column a -> Column a -> Column T.PGBool
 (.>) = unsafeGt
 
 infix 4 .<
-(.<) :: Column a -> Column a -> Column T.PGBool
+(.<) :: Ord.PGOrd a => Column a -> Column a -> Column T.PGBool
 (.<) = C.binOp HPQ.OpLt
 
 infix 4 .<=
-(.<=) :: Column a -> Column a -> Column T.PGBool
+(.<=) :: Ord.PGOrd a => Column a -> Column a -> Column T.PGBool
 (.<=) = C.binOp HPQ.OpLtEq
 
 infix 4 .>=
-(.>=) :: Column a -> Column a -> Column T.PGBool
+(.>=) :: Ord.PGOrd a => Column a -> Column a -> Column T.PGBool
 (.>=) = C.binOp HPQ.OpGtEq
 
 case_ :: [(Column T.PGBool, Column a)] -> Column a -> Column a
@@ -73,3 +76,9 @@ upper = C.unOp HPQ.OpUpper
 
 like :: Column T.PGText -> Column T.PGText -> Column T.PGBool
 like = C.binOp HPQ.OpLike
+
+ors :: F.Foldable f => f (Column T.PGBool) -> Column T.PGBool
+ors = F.foldl' (.||) (T.pgBool False)
+
+in_ :: (Functor f, F.Foldable f) => f (Column a) -> Column a -> Column T.PGBool
+in_ hs w = ors . fmap (w .==) $ hs

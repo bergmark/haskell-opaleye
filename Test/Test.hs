@@ -3,6 +3,8 @@
 
 module Main where
 
+import qualified QuickCheck
+
 import           Opaleye (Column, Nullable, Query, QueryArr, (.==), (.>))
 import qualified Opaleye as O
 
@@ -16,6 +18,7 @@ import           Data.Monoid ((<>))
 import qualified Data.String as String
 
 import qualified System.Exit as Exit
+import qualified System.Environment as Environment
 
 import qualified Control.Applicative as A
 import qualified Control.Arrow as Arr
@@ -34,6 +37,13 @@ connectInfo =  PGS.ConnectInfo { PGS.connectHost = "localhost"
                                , PGS.connectUser = "tom"
                                , PGS.connectPassword = "tom"
                                , PGS.connectDatabase = "opaleye_test" }
+
+connectInfoTravis :: PGS.ConnectInfo
+connectInfoTravis =  PGS.ConnectInfo { PGS.connectHost = "localhost"
+                                     , PGS.connectPort = 5432
+                                     , PGS.connectUser = "postgres"
+                                     , PGS.connectPassword = ""
+                                     , PGS.connectDatabase = "opaleye_test" }
 
 -- }
 
@@ -115,14 +125,22 @@ table1 = twoIntTable "table1"
 table1F :: O.Table (Column O.PGInt4, Column O.PGInt4) (Column O.PGInt4, Column O.PGInt4)
 table1F = fmap (\(col1, col2) -> (col1 + col2, col1 - col2)) table1
 
+-- This is implicitly testing our ability to handle upper case letters in table names.
 table2 :: O.Table (Column O.PGInt4, Column O.PGInt4) (Column O.PGInt4, Column O.PGInt4)
-table2 = twoIntTable "table2"
+table2 = twoIntTable "TABLE2"
 
 table3 :: O.Table (Column O.PGInt4, Column O.PGInt4) (Column O.PGInt4, Column O.PGInt4)
 table3 = twoIntTable "table3"
 
 table4 :: O.Table (Column O.PGInt4, Column O.PGInt4) (Column O.PGInt4, Column O.PGInt4)
 table4 = twoIntTable "table4"
+
+table5 :: O.Table (Maybe (Column O.PGInt4), Maybe (Column  O.PGInt4))
+                  (Column O.PGInt4, Column O.PGInt4)
+table5 = O.Table "table5" (PP.p2 (O.optional "column1", O.optional "column2"))
+
+table6 :: O.Table (Column O.PGText, Column O.PGText) (Column O.PGText, Column O.PGText)
+table6 = O.Table "table6" (PP.p2 (O.required "column1", O.required "column2"))
 
 tableKeywordColNames :: O.Table (Column O.PGInt4, Column O.PGInt4)
                                 (Column O.PGInt4, Column O.PGInt4)
@@ -136,6 +154,9 @@ table2Q = O.queryTable table2
 
 table3Q :: Query (Column O.PGInt4, Column O.PGInt4)
 table3Q = O.queryTable table3
+
+table6Q :: Query (Column O.PGText, Column O.PGText)
+table6Q = O.queryTable table6
 
 table1dataG :: Num a => [(a, a)]
 table1dataG = [ (1, 100)
@@ -178,14 +199,38 @@ table4data = table4dataG
 table4columndata :: [(Column O.PGInt4, Column O.PGInt4)]
 table4columndata = table4dataG
 
-dropAndCreateTable :: (String, [String]) -> PGS.Query
-dropAndCreateTable (t, cols) = String.fromString drop_
-  where drop_ = "DROP TABLE IF EXISTS " ++ t ++ ";"
-                ++ "CREATE TABLE " ++ t
+table6data :: [(String, String)]
+table6data = [("xy", "a"), ("z", "a"), ("more text", "a")]
+
+table6columndata :: [(Column O.PGText, Column O.PGText)]
+table6columndata = map (\(column1, column2) -> (O.pgString column1, O.pgString column2)) table6data
+
+-- We have to quote the table names here because upper case letters in
+-- table names are treated as lower case unless the name is quoted!
+dropAndCreateTable :: String -> (String, [String]) -> PGS.Query
+dropAndCreateTable columnType (t, cols) = String.fromString drop_
+  where drop_ = "DROP TABLE IF EXISTS \"" ++ t ++ "\";"
+                ++ "CREATE TABLE \"" ++ t ++ "\""
                 ++ " (" ++ commas cols ++ ");"
-        integer c = ("\"" ++ c ++ "\"" ++ " integer")
+        integer c = ("\"" ++ c ++ "\"" ++ " " ++ columnType)
         commas = L.intercalate "," . map integer
-        
+
+dropAndCreateTableInt :: (String, [String]) -> PGS.Query
+dropAndCreateTableInt = dropAndCreateTable "integer"
+
+dropAndCreateTableText :: (String, [String]) -> PGS.Query
+dropAndCreateTableText = dropAndCreateTable "text"
+
+-- We have to quote the table names here because upper case letters in
+-- table names are treated as lower case unless the name is quoted!
+dropAndCreateTableSerial :: (String, [String]) -> PGS.Query
+dropAndCreateTableSerial (t, cols) = String.fromString drop_
+  where drop_ = "DROP TABLE IF EXISTS \"" ++ t ++ "\";"
+                ++ "CREATE TABLE \"" ++ t ++ "\""
+                ++ " (" ++ commas cols ++ ");"
+        integer c = ("\"" ++ c ++ "\"" ++ " SERIAL")
+        commas = L.intercalate "," . map integer
+
 type Table_ = (String, [String])
 
 -- This should ideally be derived from the table definition above
@@ -194,12 +239,20 @@ columns2 t = (t, ["column1", "column2"])
 
 -- This should ideally be derived from the table definition above
 tables :: [Table_]
-tables = map columns2 ["table1", "table2", "table3", "table4"]
+tables = map columns2 ["table1", "TABLE2", "table3", "table4"]
          ++ [("keywordtable", ["column", "where"])]
 
+serialTables :: [Table_]
+serialTables = map columns2 ["table5"]
+
 dropAndCreateDB :: PGS.Connection -> IO ()
-dropAndCreateDB conn = mapM_ execute tables
-  where execute = PGS.execute_ conn . dropAndCreateTable
+dropAndCreateDB conn = do
+  mapM_ execute tables
+  executeTextTable
+  mapM_ executeSerial serialTables
+  where execute = PGS.execute_ conn . dropAndCreateTableInt
+        executeTextTable = (PGS.execute_ conn . dropAndCreateTableText . columns2) "table6"
+        executeSerial = PGS.execute_ conn . dropAndCreateTableSerial
 
 type Test = PGS.Connection -> IO Bool
 
@@ -266,14 +319,14 @@ testDistinct :: Test
 testDistinct = testG (O.distinct table1Q)
                (\r -> L.sort (L.nub table1data) == L.sort r)
 
--- FIXME: the unsafeCoerce is currently needed because the type
+-- FIXME: the unsafeCoerceColumn is currently needed because the type
 -- changes required for aggregation are not currently dealt with by
 -- Opaleye.
 aggregateCoerceFIXME :: QueryArr (Column O.PGInt4) (Column O.PGInt8)
 aggregateCoerceFIXME = Arr.arr aggregateCoerceFIXME'
 
 aggregateCoerceFIXME' :: Column a -> Column O.PGInt8
-aggregateCoerceFIXME' = O.unsafeCoerce
+aggregateCoerceFIXME' = O.unsafeCoerceColumn
 
 testAggregate :: Test
 testAggregate = testG (Arr.second aggregateCoerceFIXME
@@ -288,6 +341,18 @@ testAggregateProfunctor = testG q expected
         countsum = P.dimap (\x -> (x,x))
                            (\(x, y) -> aggregateCoerceFIXME' x * y)
                            (PP.p2 (O.sum, O.count))
+
+testStringArrayAggregate :: Test
+testStringArrayAggregate = testG q expected
+  where q = O.aggregate (PP.p2 (O.arrayAgg, O.min)) table6Q
+        expected r = [(map fst table6data, minimum (map snd table6data))] == r
+
+testStringAggregate :: Test
+testStringAggregate = testG q expected
+  where q = O.aggregate (PP.p2 ((O.stringAgg . O.pgString) "_", O.groupBy)) table6Q
+        expected r = [(
+          (foldl1 (\x y -> x ++ "_" ++ y) . map fst) table6data ,
+          head (map snd table6data))] == r
 
 testOrderByG :: O.Order (Column O.PGInt4, Column O.PGInt4)
                 -> ((Int, Int) -> (Int, Int) -> Ordering)
@@ -450,6 +515,7 @@ testUpdate conn = do
       then return False
       else do
       returned <- O.runInsertReturning conn table4 insertT returning
+      _ <- O.runInsertMany conn table4 insertTMany
       resultI <- runQueryTable4
 
       return ((resultI == expectedI) && (returned == expectedR))
@@ -467,8 +533,11 @@ testUpdate conn = do
         insertT :: (Column O.PGInt4, Column O.PGInt4)
         insertT = (1, 2)
 
+        insertTMany :: [(Column O.PGInt4, Column O.PGInt4)]
+        insertTMany = [(20, 30), (40, 50)]
+
         expectedI :: [(Int, Int)]
-        expectedI = [(1, 10), (1, 2)]
+        expectedI = [(1, 10), (1, 2), (20, 30), (40, 50)]
         returning (x, y) = x - y
         expectedR :: [Int]
         expectedR = [-1]
@@ -480,23 +549,58 @@ testKeywordColNames conn = do
   _ <- q
   return True
 
-  
+testInsertSerial :: Test
+testInsertSerial conn = do
+  _ <- O.runInsert conn table5 (Just 10, Just 20)
+  _ <- O.runInsert conn table5 (Just 30, Nothing)
+  _ <- O.runInsert conn table5 (Nothing, Nothing)
+  _ <- O.runInsert conn table5 (Nothing, Just 40)
+
+  resultI <- O.runQuery conn (O.queryTable table5)
+
+  return (resultI == expected)
+
+  where expected :: [(Int, Int)]
+        expected = [ (10, 20)
+                   , (30, 1)
+                   , (1, 2)
+                   , (2, 40) ]
 
 allTests :: [Test]
 allTests = [testSelect, testProduct, testRestrict, testNum, testDiv, testCase,
-            testDistinct, testAggregate, testAggregateProfunctor,
+            testDistinct, testAggregate, testAggregateProfunctor, testStringAggregate,
             testOrderBy, testOrderBy2, testOrderBySame, testLimit, testOffset,
             testLimitOffset, testOffsetLimit, testDistinctAndAggregate,
             testDoubleDistinct, testDoubleAggregate, testDoubleLeftJoin,
             testDoubleValues, testDoubleUnionAll,
             testLeftJoin, testLeftJoinNullable, testThreeWayProduct, testValues,
             testValuesEmpty, testUnionAll, testTableFunctor, testUpdate,
-            testKeywordColNames
+            testKeywordColNames, testInsertSerial
            ]
+
+-- Environment.getEnv throws an exception on missing environment variable!
+getEnv :: String -> IO (Maybe String)
+getEnv var = do
+  environment <- Environment.getEnvironment
+  return (lookup var environment)
+
+-- Using an envvar is unpleasant, but it will do for now.
+travis :: IO Bool
+travis = do
+    travis' <- getEnv "TRAVIS"
+
+    return (case travis' of
+               Nothing    -> False
+               Just "yes" -> True
+               Just _     -> False)
 
 main :: IO ()
 main = do
-  conn <- PGS.connect connectInfo
+  travis' <- travis
+
+  let connectInfo' = if travis' then connectInfoTravis else connectInfo
+
+  conn <- PGS.connect connectInfo'
 
   dropAndCreateDB conn
 
@@ -507,6 +611,10 @@ main = do
                , (table2, table2columndata)
                , (table3, table3columndata)
                , (table4, table4columndata) ]
+  insert (table6, table6columndata)
+
+  -- Need to run quickcheck after table data has been inserted
+  QuickCheck.run conn
 
   results <- mapM ($ conn) allTests
 
